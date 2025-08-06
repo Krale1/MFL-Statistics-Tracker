@@ -12,33 +12,38 @@ def get_dominant_color(image, k=3):
     if not isinstance(image, np.ndarray):
         image = np.array(image)
 
-    # Take only top 60% of the crop (remove legs and grass)
+    # Take only top 60% (remove legs/grass)
     height = image.shape[0]
     image = image[:int(height * 0.6), :, :]
 
-    # Convert to HSV to filter out grass
+    # Convert to HSV for grass filtering
     hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
 
-    # Mask out green (H in 35–85)
+    # Remove green pixels (grass)
     lower_green = np.array([35, 40, 40])
     upper_green = np.array([85, 255, 255])
     mask = cv2.inRange(hsv, lower_green, upper_green)
     mask_inv = cv2.bitwise_not(mask)
     filtered = cv2.bitwise_and(image, image, mask=mask_inv)
 
-    # Remove black pixels (from masking)
+    # Flatten and remove black pixels
     pixels = filtered.reshape(-1, 3)
-    pixels = pixels[np.any(pixels > 0, axis=1)]  # keep non-black pixels
+    pixels = pixels[np.any(pixels > 0, axis=1)]
 
-    if len(pixels) == 0:  # fallback if nothing left
-        pixels = image.reshape(-1, 3)
+    # Fallback: if no pixels left, use original crop average
+    if len(pixels) == 0:
+        return np.mean(image.reshape(-1, 3), axis=0).astype(int)
+
+    # Adjust k if too few pixels
+    k = min(k, len(pixels))
+    if k == 1:  # Only one pixel
+        return pixels[0].astype(int)
 
     pixels = np.float32(pixels)
 
     kmeans = KMeans(n_clusters=k, random_state=42)
     labels = kmeans.fit_predict(pixels)
     counts = np.bincount(labels)
-
     dominant_color = kmeans.cluster_centers_[np.argmax(counts)]
     return dominant_color.astype(int)
 
