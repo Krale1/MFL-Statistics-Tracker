@@ -47,7 +47,7 @@ def color_distance(c1, c2):
 
 def main():
     video_frames = read_video('input_videos/bul.mp4')
-    tracker = Tracker('models/best.pt')
+    tracker = Tracker('models/newbest.pt')
 
     tracks = tracker.get_object_tracks(video_frames, read_from_stub=True, stub_path='stubs/track_stubs.pkl')
     tracks['ball'] = tracker.interpolate_ball_positions(tracks['ball'])
