@@ -7,19 +7,11 @@ import numpy as np
 
 
 def main():
-    # Read video frames
     video_frames = read_video('input_videos/mkd7.mp4')
-
-    # Initialize tracker
     tracker = Tracker('models/best.pt')
-
-    # Get object tracks (players, referees, goalkeepers, ball)
     tracks = tracker.get_object_tracks(video_frames, read_from_stub=True, stub_path='stubs/track_stubs.pkl')
-
-    # Interpolate missing ball positions
     tracks['ball'] = tracker.interpolate_ball_positions(tracks['ball'])
 
-    # Extract player crops from the first frame for fitting
     print("[INFO] Extracting player crops for team classification...")
     first_frame_players = tracks['players'][0]
 
@@ -29,11 +21,9 @@ def main():
         crop = sv.crop_image(video_frames[0], bbox)
         player_crops.append(sv.cv2_to_pillow(crop))
 
-    # Initialize and fit TeamClassifier
     team_classifier = TeamClassifier(device="cuda")
     team_classifier.fit(player_crops)
 
-    # Assign teams to players across all frames using batch prediction per frame
     print("[INFO] Assigning teams to players across frames...")
     for frame_num, player_track in enumerate(tracks['players']):
         crops = []
@@ -48,13 +38,14 @@ def main():
         if len(crops) == 0:
             continue
 
-        team_labels = team_classifier.predict_batch(crops)
+        # Get (team_id, team_color_rgb) tuples for all players in this frame
+        team_info = team_classifier.predict_batch(crops)
 
-        for pid, team in zip(player_ids, team_labels):
+        for pid, (team, color) in zip(player_ids, team_info):
             tracks['players'][frame_num][pid]['team'] = team
-            tracks['players'][frame_num][pid]['team_color'] = (0, 255, 0) if team == 1 else (0, 0, 255)
+            tracks['players'][frame_num][pid]['team_color'] = tuple(int(c) for c in color)
 
-    # Assign goalkeepers by proximity
+    # Goalkeepers assignment remains the same
     for frame_num in range(len(tracks['goalkeepers'])):
         gk_assignments = team_classifier.assign_goalkeeper_by_proximity(
             tracks['players'][frame_num],
@@ -62,9 +53,9 @@ def main():
         )
         for gk_id, team in gk_assignments.items():
             tracks['goalkeepers'][frame_num][gk_id]['team'] = team
-            tracks['goalkeepers'][frame_num][gk_id]['team_color'] = (0, 255, 0) if team == 1 else (0, 0, 255)
+            tracks['goalkeepers'][frame_num][gk_id]['team_color'] = (0, 255, 0) if team == 1 else (255, 0, 0)
 
-    # Assign ball possession
+    # Ball possession logic remains unchanged
     player_assigner = PlayerBallAssigner()
     team_ball_control = []
 
@@ -91,7 +82,6 @@ def main():
 
     team_ball_control = np.array(team_ball_control)
 
-    # Draw annotations and save video
     output_video_frames = tracker.draw_annotations(video_frames, tracks, team_ball_control)
     save_video(output_video_frames, 'output_videos/processed_video.avi')
 
