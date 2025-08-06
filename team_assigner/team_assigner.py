@@ -35,8 +35,6 @@ class TeamClassifier:
 
                 embeddings_list.append(batch_embeddings.cpu().numpy())
 
-                print(f"[INFO] Processing batch of {len(batch)} crops...")
-
         return np.concatenate(embeddings_list)
 
     def fit(self, crops):

@@ -8,8 +8,3 @@ results = model.predict(
     project='runs',     
     name='predict'         
 )
-
-print(results[0])
-for box in results[0].boxes:
-    print(box)
-    print('---------------')
