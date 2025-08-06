@@ -54,8 +54,6 @@ class TeamClassifier:
         self.embeddings = embeddings
         self.reduced_embeddings = reduced_embeddings
 
-        print("[INFO] Extracting embeddings for", len(crops), "crops...")
-
     def predict(self, crop):
         if self.kmeans is None or self.reducer is None:
             raise ValueError("You must call fit() before predict().")
