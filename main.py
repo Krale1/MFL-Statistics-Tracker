@@ -1,61 +1,97 @@
 from utils import read_video, save_video
 from trackers import Tracker
 from team_assigner import TeamClassifier
-import supervision as sv
-from player_ball_assigner import PlayerBallAssigner
+import cv2
 import numpy as np
+from player_ball_assigner import PlayerBallAssigner
+import supervision as sv
+from PIL import Image
+from sklearn.cluster import KMeans
+
+# --- helper function to get dominant color ---
+def get_dominant_color(image, k=3):
+    if not isinstance(image, np.ndarray):
+        image = np.array(image)
+
+    pixels = image.reshape(-1, 3)
+    pixels = np.float32(pixels)
+
+    kmeans = KMeans(n_clusters=k, random_state=42)
+    labels = kmeans.fit_predict(pixels)
+    counts = np.bincount(labels)
+
+    dominant_color = kmeans.cluster_centers_[np.argmax(counts)]
+    return dominant_color.astype(int)
 
 
 def main():
     video_frames = read_video('input_videos/mkd7.mp4')
     tracker = Tracker('models/best.pt')
+
     tracks = tracker.get_object_tracks(video_frames, read_from_stub=True, stub_path='stubs/track_stubs.pkl')
     tracks['ball'] = tracker.interpolate_ball_positions(tracks['ball'])
 
     print("[INFO] Extracting player crops for team classification...")
     first_frame_players = tracks['players'][0]
+    frame = video_frames[0]
 
     player_crops = []
+    player_ids = []
+
     for player_id, player_data in first_frame_players.items():
         bbox = player_data["bbox"]
-        crop = sv.crop_image(video_frames[0], bbox)
+        crop = sv.crop_image(frame, bbox)
         player_crops.append(sv.cv2_to_pillow(crop))
+        player_ids.append(player_id)
 
     team_classifier = TeamClassifier(device="cuda")
     team_classifier.fit(player_crops)
 
-    print("[INFO] Assigning teams to players across frames...")
+    # --- Dynamic team color extraction ---
+    cluster_colors = {0: [], 1: []}
+
+    for player_id, player_data in first_frame_players.items():
+        crop = sv.crop_image(frame, player_data['bbox'])
+        pil_crop = sv.cv2_to_pillow(crop)
+        cluster_id = team_classifier.predict(pil_crop) - 1
+        dom_color = get_dominant_color(crop)
+        cluster_colors[cluster_id].append(dom_color)
+
+    cluster_to_color = {}
+    for cluster_id, colors in cluster_colors.items():
+        if len(colors) > 0:
+            avg_color = np.mean(colors, axis=0).astype(int)
+            cluster_to_color[cluster_id] = avg_color
+        else:
+            cluster_to_color[cluster_id] = np.array([128, 128, 128])  # fallback gray
+
+    print("[INFO] Cluster to team color mapping:")
+    for cid, color in cluster_to_color.items():
+        print(f" Cluster {cid}: {color}")
+
+    print("[INFO] Assigning teams and colors across all frames...")
+
     for frame_num, player_track in enumerate(tracks['players']):
-        crops = []
-        player_ids = []
-
         for player_id, track in player_track.items():
-            bbox = track['bbox']
-            crop = sv.crop_image(video_frames[frame_num], bbox)
-            crops.append(sv.cv2_to_pillow(crop))
-            player_ids.append(player_id)
+            crop = sv.crop_image(video_frames[frame_num], track['bbox'])
+            pil_crop = sv.cv2_to_pillow(crop)
+            cluster_id = team_classifier.predict(pil_crop) - 1
+            team_color = cluster_to_color.get(cluster_id, np.array([128, 128, 128]))
 
-        if len(crops) == 0:
-            continue
+            tracks['players'][frame_num][player_id]['team'] = cluster_id + 1
+            tracks['players'][frame_num][player_id]['team_color'] = tuple(team_color.tolist())
 
-        # Get (team_id, team_color_rgb) tuples for all players in this frame
-        team_info = team_classifier.predict_batch(crops)
-
-        for pid, (team, color) in zip(player_ids, team_info):
-            tracks['players'][frame_num][pid]['team'] = team
-            tracks['players'][frame_num][pid]['team_color'] = tuple(int(c) for c in color)
-
-    # Goalkeepers assignment remains the same
+    # Assign Goalkeepers by proximity using cluster_id teams
     for frame_num in range(len(tracks['goalkeepers'])):
         gk_assignments = team_classifier.assign_goalkeeper_by_proximity(
             tracks['players'][frame_num],
             tracks['goalkeepers'][frame_num]
         )
         for gk_id, team in gk_assignments.items():
+            team_color = cluster_to_color.get(team - 1, np.array([128, 128, 128]))
             tracks['goalkeepers'][frame_num][gk_id]['team'] = team
-            tracks['goalkeepers'][frame_num][gk_id]['team_color'] = (0, 255, 0) if team == 1 else (255, 0, 0)
+            tracks['goalkeepers'][frame_num][gk_id]['team_color'] = tuple(team_color.tolist())
 
-    # Ball possession logic remains unchanged
     player_assigner = PlayerBallAssigner()
     team_ball_control = []
 
@@ -83,6 +119,7 @@ def main():
     team_ball_control = np.array(team_ball_control)
 
     output_video_frames = tracker.draw_annotations(video_frames, tracks, team_ball_control)
+
     save_video(output_video_frames, 'output_videos/processed_video.avi')
 
 

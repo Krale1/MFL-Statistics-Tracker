@@ -4,34 +4,6 @@ from sklearn.cluster import KMeans
 import umap
 from transformers import AutoProcessor, SiglipVisionModel
 from more_itertools import chunked
-import cv2
-
-def get_dominant_color(image, k=3):
-    """
-    Get dominant color of an image (PIL or numpy ndarray).
-    Returns RGB tuple.
-    """
-    if not isinstance(image, np.ndarray):
-        image = np.array(image)
-
-    # Convert to RGB if grayscale or with alpha channel
-    if image.shape[-1] == 4:
-        image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
-    elif len(image.shape) == 2:
-        image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-
-    # Reshape image pixels to (num_pixels, 3)
-    pixels = image.reshape(-1, 3)
-    pixels = np.float32(pixels)
-
-    # KMeans clustering on pixels
-    kmeans = KMeans(n_clusters=k, random_state=42)
-    labels = kmeans.fit_predict(pixels)
-    counts = np.bincount(labels)
-
-    # Most frequent cluster center is dominant color
-    dominant_color = kmeans.cluster_centers_[np.argmax(counts)]
-    return dominant_color.astype(int)
 
 
 class TeamClassifier:
@@ -40,16 +12,19 @@ class TeamClassifier:
         self.model_name = model_name
         self.n_clusters = n_clusters
 
+        # Load SigLIP model and processor
         self.model = SiglipVisionModel.from_pretrained(self.model_name).to(self.device)
-        self.processor = AutoProcessor.from_pretrained(self.model_name, use_fast=True)
+        self.processor = AutoProcessor.from_pretrained(self.model_name)
 
+        # For clustering
         self.reducer = None
         self.kmeans = None
-        self.cluster_to_color = {}  # Mapping cluster_id -> assigned RGB color
+        self.player_team_dict = {}
 
     def _extract_embeddings(self, crops, batch_size=32):
         embeddings_list = []
         self.model.eval()
+
         with torch.no_grad():
             for batch in chunked(crops, batch_size):
                 inputs = self.processor(images=batch, return_tensors="pt").to(self.device)
@@ -59,6 +34,8 @@ class TeamClassifier:
                 batch_embeddings = torch.nn.functional.normalize(batch_embeddings, p=2, dim=1)
 
                 embeddings_list.append(batch_embeddings.cpu().numpy())
+
+                print(f"[INFO] Processing batch of {len(batch)} crops...")
 
         return np.concatenate(embeddings_list)
 
@@ -72,47 +49,22 @@ class TeamClassifier:
 
         print(f"[INFO] Clustering into {self.n_clusters} teams...")
         self.kmeans = KMeans(n_clusters=self.n_clusters, random_state=42)
-        cluster_labels = self.kmeans.fit_predict(reduced_embeddings)
+        self.kmeans.fit(reduced_embeddings)
 
         self.embeddings = embeddings
         self.reduced_embeddings = reduced_embeddings
 
-        # Define your team colors (in RGB)
-        team_colors = {
-            0: np.array([0, 255, 0]),   # green
-            1: np.array([255, 0, 0])    # red, using bright red instead of blue for clarity
-        }
+        print("[INFO] Extracting embeddings for", len(crops), "crops...")
 
-        # Calculate average dominant color per cluster
-        cluster_colors = {i: [] for i in range(self.n_clusters)}
-        for crop, cluster_id in zip(crops, cluster_labels):
-            dom_color = get_dominant_color(crop)
-            cluster_colors[cluster_id].append(dom_color)
-
-        avg_cluster_colors = {}
-        for cluster_id, colors in cluster_colors.items():
-            avg_color = np.mean(colors, axis=0)
-            avg_cluster_colors[cluster_id] = avg_color
-
-        # Match cluster average color to closest predefined team color
-        self.cluster_to_color = {}
-        for cluster_id, avg_color in avg_cluster_colors.items():
-            distances = {team_id: np.linalg.norm(avg_color - col) for team_id, col in team_colors.items()}
-            best_team = min(distances, key=distances.get)
-            self.cluster_to_color[cluster_id] = team_colors[best_team]
-
-        print("[INFO] Cluster to team color mapping:", self.cluster_to_color)
-
-    def predict_batch(self, crops):
+    def predict(self, crop):
         if self.kmeans is None or self.reducer is None:
-            raise ValueError("You must call fit() before predict_batch().")
+            raise ValueError("You must call fit() before predict().")
 
-        embeddings = self._extract_embeddings(crops)
-        reduced_embeddings = self.reducer.transform(embeddings)
-        cluster_labels = self.kmeans.predict(reduced_embeddings)
+        embedding = self._extract_embeddings([crop])
+        reduced_embedding = self.reducer.transform(embedding)
 
-        # Map cluster label to team color RGB
-        return [(int(cluster_id) + 1, self.cluster_to_color[cluster_id]) for cluster_id in cluster_labels]
+        team_label = self.kmeans.predict(reduced_embedding)[0]
+        return int(team_label) + 1  # 1 or 2
 
     def assign_goalkeeper_by_proximity(self, players_dict, goalkeeper_dict):
         if len(players_dict) == 0 or len(goalkeeper_dict) == 0:
