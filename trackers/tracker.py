@@ -113,8 +113,9 @@ class Tracker:
             for d in det_sv:
                 bbox = d[0].tolist()
                 cls_id = d[3]
+                
                 if cls_id == cls_map.get('ball'):
-                    tracks["ball"][frame_num][1] = {"bbox": bbox}
+                    tracks["ball"][frame_num][1] = {"bbox": bbox, "detected": True}
 
         if stub_path:
             with open(stub_path, 'wb') as f:
@@ -193,21 +194,37 @@ class Tracker:
             referees = tracks["referees"][f]
             balls = tracks["ball"][f]
 
+            # Draw players
             for pid, p in players.items():
                 frame = self.draw_ellipse(frame, p["bbox"], p.get("team_color", (255, 0, 0)), pid)
-                if p.get("has_ball"): frame = self.draw_triangle(frame, p["bbox"], (0, 0, 255))
+                if p.get("has_ball"): 
+                    frame = self.draw_triangle(frame, p["bbox"], (0, 0, 255))
 
+            # Draw goalkeepers
             for gid, gk in goalkeepers.items():
                 frame = self.draw_ellipse(frame, gk["bbox"], gk.get("team_color", (0, 0, 255)), gid, is_goalkeeper=True)
-                if gk.get("has_ball"): frame = self.draw_triangle(frame, gk["bbox"], (0, 0, 255))
+                if gk.get("has_ball"): 
+                    frame = self.draw_triangle(frame, gk["bbox"], (0, 0, 255))
 
+            # Draw referees
             for rid, ref in referees.items():
                 frame = self.draw_ellipse(frame, ref["bbox"], (0, 255, 255))
 
-            for bid, b in balls.items():
-                frame = self.draw_triangle(frame, b["bbox"], (0, 255, 0))
+            # 🟩 Always draw ball — from detection or interpolation
+            # Ball logic
+            if 1 in balls:
+                # Detected or interpolated
+                color = (0, 255, 0) if balls[1].get("detected", False) else (0, 180, 0)
+                frame = self.draw_triangle(frame, balls[1]["bbox"], color)
+            else:
+                # No ball at all this frame → draw gray triangle at last known position
+                if f > 0 and 1 in tracks["ball"][f - 1]:
+                    last_bbox = tracks["ball"][f - 1][1]["bbox"]
+                    frame = self.draw_triangle(frame, last_bbox, (128, 128, 128))
 
+            # Draw team possession bar
             frame = self.draw_team_ball_control(frame, f, team_ball_control)
+
             output.append(frame)
 
         return output
