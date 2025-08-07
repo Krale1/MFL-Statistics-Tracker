@@ -51,7 +51,7 @@ def get_dominant_color(image, k=3):
 
 def main():
     video_frames = read_video('input_videos/Final.mp4')
-    tracker = Tracker('models/best.pt')
+    tracker = Tracker('models/newbest.pt')
 
     # Get tracks from YOLO + ByteTrack
     tracks = tracker.get_object_tracks(video_frames, read_from_stub=True, stub_path='stubs/track_stubs.pkl')
