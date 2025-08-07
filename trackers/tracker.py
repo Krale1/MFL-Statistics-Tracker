@@ -1,196 +1,213 @@
 from ultralytics import YOLO
 import os
-import pickle 
+import pickle
 import supervision as sv
 import sys
 import pandas as pd
 import numpy as np
 import cv2
+
 sys.path.append('../')
 from utils import get_center_of_bbox, get_width_of_bbox
+
+REID_COLOR_THRESH = 40
+REID_DIST_THRESH = 50
+REID_MEMORY = 30
 
 class Tracker:
     def __init__(self, model_path):
         self.model = YOLO(model_path)
         self.tracker = sv.ByteTrack()
+        self.tracker.match_thresh = 0.8
+        self.next_stable_id = 1
+        self.recent_players = {}
+
+    def _get_hsv(self, frame, bbox):
+        x1, y1, x2, y2 = map(int, bbox)
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return np.array([0, 0, 0])
+        crop = crop[int(crop.shape[0]*0.1):int(crop.shape[0]*0.5), int(crop.shape[1]*0.2):int(crop.shape[1]*0.8)]
+        if crop.size == 0:
+            return np.array([0, 0, 0])
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        hsv = hsv.reshape(-1, 3)
+        return np.mean(hsv, axis=0)
+
+    def _assign_stable_id(self, raw_id, bbox, hsv_color, frame_num):
+        cx, cy = get_center_of_bbox(bbox)
+
+        for prev_raw_id, info in self.recent_players.items():
+            if frame_num - info["last_seen"] > REID_MEMORY:
+                continue
+
+            prev_cx, prev_cy = info["pos"]
+            dist = np.linalg.norm([cx - prev_cx, cy - prev_cy])
+            color_dist = np.linalg.norm(hsv_color - info["hsv"])
+
+            if dist < REID_DIST_THRESH and color_dist < REID_COLOR_THRESH:
+                self.recent_players[prev_raw_id]["last_seen"] = frame_num
+                self.recent_players[prev_raw_id]["pos"] = (cx, cy)
+                self.recent_players[prev_raw_id]["hsv"] = hsv_color
+                return info["stable_id"]
+
+        stable_id = self.next_stable_id
+        self.next_stable_id += 1
+        self.recent_players[raw_id] = {
+            "stable_id": stable_id,
+            "pos": (cx, cy),
+            "hsv": hsv_color,
+            "last_seen": frame_num
+        }
+        return stable_id
 
     def interpolate_ball_positions(self, ball_positions):
         ball_positions = [x.get(1, {}).get('bbox', []) for x in ball_positions]
-        df_ball_positions =  pd.DataFrame(ball_positions, columns=['x1', 'y1', 'x2', 'y2'])
+        df = pd.DataFrame(ball_positions, columns=['x1', 'y1', 'x2', 'y2'])
+        df = df.interpolate().bfill()
+        return [{1: {"bbox": x}} for x in df.to_numpy().tolist()]
 
-        # Interpolate missing ball positions
-        df_ball_positions = df_ball_positions.interpolate()
-        df_ball_positions = df_ball_positions.bfill()
-
-        ball_positions = [{1: {"bbox" : x }} for x in df_ball_positions.to_numpy().tolist()]
-
-        return ball_positions
-
-    def detect_frames(self, frames):
-        batch_size=20 
-        detections = [] 
-        for i in range(0,len(frames),batch_size):
-            detections_batch = self.model.predict(frames[i:i+batch_size],conf=0.1)
-            detections += detections_batch
+    def detect_frames(self, frames, batch_size=20):
+        detections = []
+        for i in range(0, len(frames), batch_size):
+            detections_batch = self.model.predict(frames[i:i + batch_size], conf=0.3)
+            detections.extend(detections_batch)
         return detections
-    
+
     def get_object_tracks(self, frames, read_from_stub=True, stub_path=None):
-        if read_from_stub and stub_path is not None and os.path.exists(stub_path):
-            with open(stub_path,'rb') as f:
-                tracks = pickle.load(f)
-            return tracks
+        if read_from_stub and stub_path and os.path.exists(stub_path):
+            with open(stub_path, 'rb') as f:
+                return pickle.load(f)
 
         detections = self.detect_frames(frames)
+        tracks = {"players": [], "referees": [], "ball": [], "goalkeepers": []}
 
-        tracks={
-            "players":[],
-            "referees":[],
-            "ball":[],
-            "goalkeepers":[]
-        }
-
-        for frame_num, detection in enumerate(detections):
-            cls_names = detection.names
-            cls_names_inv = {v:k for k,v in cls_names.items()}
-
-            # Convert to supervision Detection format
-            detection_supervision = sv.Detections.from_ultralytics(detection)
-            # Track Objects
-            detection_with_tracks = self.tracker.update_with_detections(detection_supervision)
+        for frame_num, (det, frame) in enumerate(zip(detections, frames)):
+            cls_map = {v: k for k, v in det.names.items()}
+            det_sv = sv.Detections.from_ultralytics(det)
+            tracked = self.tracker.update_with_detections(det_sv)
 
             tracks["players"].append({})
             tracks["referees"].append({})
             tracks["ball"].append({})
             tracks["goalkeepers"].append({})
 
-            for frame_detection in detection_with_tracks:
-                bbox = frame_detection[0].tolist()
-                cls_id = frame_detection[3]
-                track_id = frame_detection[4]
+            for d in tracked:
+                bbox = d[0].tolist()
+                cls_id = d[3]
+                raw_id = d[4]
 
-                if cls_id == cls_names_inv['player']:
-                    tracks["players"][frame_num][track_id] = {"bbox":bbox}
+                hsv = self._get_hsv(frame, bbox)
 
-                if cls_id == cls_names_inv['goalkeeper']:
-                    tracks["goalkeepers"][frame_num][track_id] = {"bbox": bbox}
+                if cls_id == cls_map.get('player'):
+                    sid = self._assign_stable_id(raw_id, bbox, hsv, frame_num)
+                    tracks["players"][frame_num][sid] = {"bbox": bbox}
 
-                if cls_id == cls_names_inv['referee']:
-                    tracks["referees"][frame_num][track_id] = {"bbox":bbox}
-            
-            for frame_detection in detection_supervision:
-                bbox = frame_detection[0].tolist()
-                cls_id = frame_detection[3]
+                elif cls_id == cls_map.get('goalkeeper'):
+                    sid = self._assign_stable_id(raw_id, bbox, hsv, frame_num)
+                    tracks["goalkeepers"][frame_num][sid] = {"bbox": bbox}
 
-                if cls_id == cls_names_inv['ball']:
-                    tracks["ball"][frame_num][1] = {"bbox":bbox}
+                elif cls_id == cls_map.get('referee'):
+                    tracks["referees"][frame_num][raw_id] = {"bbox": bbox}
 
-        if stub_path is not None:
-            with open(stub_path,'wb') as f:
-                pickle.dump(tracks,f)
+            for d in det_sv:
+                bbox = d[0].tolist()
+                cls_id = d[3]
+                if cls_id == cls_map.get('ball'):
+                    tracks["ball"][frame_num][1] = {"bbox": bbox}
+
+        if stub_path:
+            with open(stub_path, 'wb') as f:
+                pickle.dump(tracks, f)
 
         return tracks
 
     def draw_triangle(self, frame, bbox, color):
+        x, _ = get_center_of_bbox(bbox)
         y = int(bbox[1])
-        x,_ = get_center_of_bbox(bbox)
-
-        trinagle_points = np.array([[x, y], [x-10, y-20], [x+10, y-20]])
-        
-        cv2.drawContours(frame, [trinagle_points], 0, color, cv2.FILLED)
-        cv2.drawContours(frame, [trinagle_points], 0, (0, 0, 0), 2)
-
+        triangle = np.array([[x, y], [x - 10, y - 20], [x + 10, y - 20]])
+        color = tuple(int(c) for c in color)
+        cv2.drawContours(frame, [triangle], 0, color, cv2.FILLED)
+        cv2.drawContours(frame, [triangle], 0, (0, 0, 0), 2)
         return frame
-        
-    def draw_ellipse(self, frame, bbox, color, track_id=None, is_goalkeeper=False):
-        y2 = int(bbox[3])
 
+    def draw_ellipse(self, frame, bbox, color, track_id=None, is_goalkeeper=False):
+        color = tuple(int(c) for c in color)
+        y2 = int(bbox[3])
         x_center, _ = get_center_of_bbox(bbox)
         width = get_width_of_bbox(bbox)
-        
-        thickness = 3 if is_goalkeeper else 2  # thicker border for goalkeepers
-        
-        cv2.ellipse(frame, center=(x_center, y2), axes=(int(width), int(0.35*width)), angle=0.0, startAngle=-45, endAngle=235, color=color, thickness=thickness, lineType=cv2.LINE_4)
+        thickness = 3 if is_goalkeeper else 2
 
-        rectangle_width = 40 
-        rectangle_height = 20
-        x1_rect = x_center - rectangle_width // 2
-        x2_rect = x_center + rectangle_width // 2
-        y1_rect = (y2 - rectangle_height//2) + 15
-        y2_rect = (y2 + rectangle_height//2) + 15
+        cv2.ellipse(
+            frame,
+            center=(x_center, y2),
+            axes=(int(width), int(0.35 * width)),
+            angle=0,
+            startAngle=-45,
+            endAngle=235,
+            color=color,
+            thickness=thickness,
+            lineType=cv2.LINE_4
+        )
 
         if track_id is not None:
-            cv2.rectangle(frame, (int(x1_rect), int(y1_rect)), (int(x2_rect), int(y2_rect)), color, cv2.FILLED)
+            w, h = 40, 20
+            x1, y1 = x_center - w // 2, y2 + 15 - h // 2
+            x2, y2b = x1 + w, y1 + h
+            cv2.rectangle(frame, (x1, y1), (x2, y2b), color, cv2.FILLED)
+            text_x = x1 + 12 - (10 if str(track_id).isdigit() and int(track_id) > 99 else 0)
+            cv2.putText(frame, str(track_id), (text_x, y1 + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
 
-            x1_text = x1_rect + 12
-            # Convert to string and check if digit for int conversion
-            str_id = str(track_id)
-            if str_id.isdigit() and int(str_id) > 99:
-                x1_text -= 10
-            
-            cv2.putText(frame, str_id, (int(x1_text), int(y1_rect + 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
+        return frame
 
-        return frame  
-    
     def draw_team_ball_control(self, frame, frame_num, team_ball_control):
-        # Draw a semi-transparent rectangle at the bottom of the frame
         overlay = frame.copy()
-        cv2.rectangle(overlay, (1350, 850), (1900, 970), (255, 255, 255), -1)
-        alpha = 0.4  # Transparency factor
-        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+        h, w = frame.shape[:2]
+        x1, y1 = int(w * 0.7), int(h * 0.85)
+        x2, y2 = int(w * 0.95), int(h * 0.97)
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (255, 255, 255), -1)
+        frame = cv2.addWeighted(overlay, 0.4, frame, 0.6, 0)
 
-        team_ball_control_till_frame = team_ball_control[:frame_num+1]
-        
-        # Count ball possession for each team
-        team_1_num_frames = (team_ball_control_till_frame == 1).sum()
-        team_2_num_frames = (team_ball_control_till_frame == 2).sum()
+        history = team_ball_control[:frame_num + 1]
+        t1 = (history == 1).sum()
+        t2 = (history == 2).sum()
+        total = t1 + t2
+        pct1 = t1 / total if total else 0
+        pct2 = t2 / total if total else 0
 
-        if (team_1_num_frames + team_2_num_frames) > 0:
-            team_1 = team_1_num_frames / (team_1_num_frames + team_2_num_frames)
-            team_2 = team_2_num_frames / (team_1_num_frames + team_2_num_frames)
-        else:
-            team_1 = 0
-            team_2 = 0
+        cv2.putText(frame, f"Team 1 Possession: {pct1 * 100:.2f}%", (x1 + 10, y1 + 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
 
-        # Draw the team possession
-        cv2.putText(frame, f"Team 1 Possession: {team_1*100:.2f}%", (1400, 900), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 3)
-        cv2.putText(frame, f"Team 2 Possession: {team_2*100:.2f}%", (1400, 950), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 3)
+        cv2.putText(frame, f"Team 2 Possession: {pct2 * 100:.2f}%", (x1 + 10, y1 + 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+
 
         return frame
 
     def draw_annotations(self, video_frames, tracks, team_ball_control):
-        output_video_frames = []
-        for frame_num, frame in enumerate(video_frames):
+        output = []
+        for f, frame in enumerate(video_frames):
             frame = frame.copy()
+            players = tracks["players"][f]
+            goalkeepers = tracks["goalkeepers"][f]
+            referees = tracks["referees"][f]
+            balls = tracks["ball"][f]
 
-            player_dict = tracks["players"][frame_num]
-            goalkeeper_dict = tracks["goalkeepers"][frame_num]
-            ball_dict = tracks["ball"][frame_num]
-            referee_dict = tracks["referees"][frame_num]
+            for pid, p in players.items():
+                frame = self.draw_ellipse(frame, p["bbox"], p.get("team_color", (255, 0, 0)), pid)
+                if p.get("has_ball"): frame = self.draw_triangle(frame, p["bbox"], (0, 0, 255))
 
-            # Draw players
-            for track_id, player in player_dict.items():
-                color = player.get("team_color", (255, 0, 0))
-                frame = self.draw_ellipse(frame, player["bbox"], color, track_id)
-                if player.get("has_ball", False):
-                    frame = self.draw_triangle(frame, player["bbox"], (0, 0, 255))
+            for gid, gk in goalkeepers.items():
+                frame = self.draw_ellipse(frame, gk["bbox"], gk.get("team_color", (0, 0, 255)), gid, is_goalkeeper=True)
+                if gk.get("has_ball"): frame = self.draw_triangle(frame, gk["bbox"], (0, 0, 255))
 
-            # Draw goalkeepers with thicker ellipse and GK label
-            for gk_id, goalkeeper in goalkeeper_dict.items():
-                color = goalkeeper.get("team_color", (0, 0, 255))  # fallback color
-                frame = self.draw_ellipse(frame, goalkeeper["bbox"], color, f"{gk_id}", is_goalkeeper=True)
-                if goalkeeper.get("has_ball", False):
-                    frame = self.draw_triangle(frame, goalkeeper["bbox"], (0, 0, 255))
+            for rid, ref in referees.items():
+                frame = self.draw_ellipse(frame, ref["bbox"], (0, 255, 255))
 
-            # Draw referees
-            for track_id, referee in referee_dict.items():
-                frame = self.draw_ellipse(frame, referee["bbox"], (0, 255, 255))
+            for bid, b in balls.items():
+                frame = self.draw_triangle(frame, b["bbox"], (0, 255, 0))
 
-            # Draw ball
-            for track_id, ball in ball_dict.items():
-                frame = self.draw_triangle(frame, ball["bbox"], (0, 255, 0))
+            frame = self.draw_team_ball_control(frame, f, team_ball_control)
+            output.append(frame)
 
-            # Draw Team Possession
-            frame = self.draw_team_ball_control(frame, frame_num, team_ball_control)
-            output_video_frames.append(frame)
-
-        return output_video_frames
+        return output

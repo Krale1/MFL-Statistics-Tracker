@@ -1,92 +1,91 @@
-import torch
+# team_assigner.py
+
 import numpy as np
 from sklearn.cluster import KMeans
-import umap
-from transformers import AutoProcessor, SiglipVisionModel
-from more_itertools import chunked
+import cv2
 
 
 class TeamClassifier:
-    def __init__(self, model_name='google/siglip-base-patch16-224', device=None, n_clusters=2):
-        self.device = 'cuda' if (torch.cuda.is_available() and device == 'cuda') else 'cpu'
-        self.model_name = model_name
+    def __init__(self, n_clusters=2):
         self.n_clusters = n_clusters
-
-        # Load SigLIP model and processor
-        self.model = SiglipVisionModel.from_pretrained(self.model_name).to(self.device)
-        self.processor = AutoProcessor.from_pretrained(self.model_name)
-
-        # For clustering
-        self.reducer = None
         self.kmeans = None
-        self.player_team_dict = {}
+        self.cluster_to_color = {}
 
-    def _extract_embeddings(self, crops, batch_size=32):
-        embeddings_list = []
-        self.model.eval()
+    def _get_dominant_hsv(self, image):
+        """
+        Extract dominant HSV color from upper torso (centered).
+        Returns mean HSV.
+        """
+        if not isinstance(image, np.ndarray):
+            image = np.array(image)
 
-        with torch.no_grad():
-            for batch in chunked(crops, batch_size):
-                inputs = self.processor(images=batch, return_tensors="pt").to(self.device)
-                outputs = self.model(**inputs)
+        # Crop center top 40% of the image
+        h, w = image.shape[:2]
+        crop = image[int(h * 0.05):int(h * 0.45), int(w * 0.2):int(w * 0.8)]
 
-                batch_embeddings = torch.mean(outputs.last_hidden_state, dim=1)
-                batch_embeddings = torch.nn.functional.normalize(batch_embeddings, p=2, dim=1)
+        rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
 
-                embeddings_list.append(batch_embeddings.cpu().numpy())
+        # Mask out green grass
+        lower_green = np.array([36, 50, 50])
+        upper_green = np.array([86, 255, 255])
+        mask = cv2.inRange(hsv, lower_green, upper_green)
+        hsv_masked = hsv[mask == 0]
 
-        return np.concatenate(embeddings_list)
+        if len(hsv_masked) == 0:
+            hsv_masked = hsv.reshape(-1, 3)
 
-    def fit(self, crops):
-        print("[INFO] Extracting embeddings for player crops...")
-        embeddings = self._extract_embeddings(crops)
+        return np.mean(hsv_masked, axis=0)
 
-        print("[INFO] Reducing dimensions with UMAP...")
-        self.reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='cosine', random_state=42)
-        reduced_embeddings = self.reducer.fit_transform(embeddings)
+    def fit(self, player_crops):
+        print("[INFO] Extracting dominant HSV from players...")
+        self.hsv_colors = np.array([self._get_dominant_hsv(crop) for crop in player_crops])
 
-        print(f"[INFO] Clustering into {self.n_clusters} teams...")
         self.kmeans = KMeans(n_clusters=self.n_clusters, random_state=42)
-        self.kmeans.fit(reduced_embeddings)
+        self.kmeans.fit(self.hsv_colors)
 
-        self.embeddings = embeddings
-        self.reduced_embeddings = reduced_embeddings
+        labels = self.kmeans.labels_
+        cluster_colors = {i: [] for i in range(self.n_clusters)}
+
+        for label, hsv in zip(labels, self.hsv_colors):
+            cluster_colors[label].append(hsv)
+
+        for i in range(self.n_clusters):
+            mean_hsv = np.mean(cluster_colors[i], axis=0)
+            bgr = cv2.cvtColor(np.uint8([[mean_hsv]]), cv2.COLOR_HSV2BGR)[0][0]
+            self.cluster_to_color[i] = bgr.astype(int)
+
+        print("[INFO] Cluster color centers (BGR):", self.cluster_to_color)
 
     def predict(self, crop):
-        if self.kmeans is None or self.reducer is None:
-            raise ValueError("You must call fit() before predict().")
+        hsv = self._get_dominant_hsv(crop)
+        distances = [np.linalg.norm(hsv - center) for center in self.kmeans.cluster_centers_]
+        cluster_id = int(np.argmin(distances))
+        return cluster_id + 1
 
-        embedding = self._extract_embeddings([crop])
-        reduced_embedding = self.reducer.transform(embedding)
-
-        team_label = self.kmeans.predict(reduced_embedding)[0]
-        return int(team_label) + 1  # 1 or 2
+    def get_cluster_color_centroids(self):
+        return self.cluster_to_color
 
     def assign_goalkeeper_by_proximity(self, players_dict, goalkeeper_dict):
         if len(players_dict) == 0 or len(goalkeeper_dict) == 0:
             return {}
 
         team_positions = {1: [], 2: []}
-        for _, player in players_dict.items():
+        for player in players_dict.values():
             bbox = player['bbox']
-            center_x = (bbox[0] + bbox[2]) / 2
-            center_y = bbox[3]
-            team_positions[player['team']].append((center_x, center_y))
-
-        if not team_positions[1] or not team_positions[2]:
-            return {}
-
-        team_1_centroid = np.mean(team_positions[1], axis=0)
-        team_2_centroid = np.mean(team_positions[2], axis=0)
+            x = (bbox[0] + bbox[2]) / 2
+            y = bbox[3]
+            team_positions[player['team']].append((x, y))
 
         gk_team_assignment = {}
-        for gk_id, gk_data in goalkeeper_dict.items():
-            gk_bbox = gk_data['bbox']
-            gk_center = np.array([(gk_bbox[0] + gk_bbox[2]) / 2, gk_bbox[3]])
-
-            dist_1 = np.linalg.norm(gk_center - team_1_centroid)
-            dist_2 = np.linalg.norm(gk_center - team_2_centroid)
-
-            gk_team_assignment[gk_id] = 1 if dist_1 < dist_2 else 2
+        for gk_id, gk in goalkeeper_dict.items():
+            bbox = gk['bbox']
+            x = (bbox[0] + bbox[2]) / 2
+            y = bbox[3]
+            dists = []
+            for t in [1, 2]:
+                if team_positions[t]:
+                    dists.append((t, np.linalg.norm(np.array([x, y]) - np.mean(team_positions[t], axis=0))))
+            gk_team_assignment[gk_id] = min(dists, key=lambda x: x[1])[0]
 
         return gk_team_assignment
