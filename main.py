@@ -12,7 +12,7 @@ import supervision as sv
 
 def main():
     video_frames = read_video('input_videos/Final.mp4')
-    tracker = Tracker('models/newbest.pt')
+    tracker = Tracker('models/model.pt')
 
     tracks = tracker.get_object_tracks(video_frames, read_from_stub=True, stub_path='stubs/track_stubs.pkl')
     tracks['ball'] = tracker.interpolate_ball_positions(tracks['ball'])

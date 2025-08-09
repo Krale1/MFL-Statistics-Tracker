@@ -18,7 +18,7 @@ class Tracker:
     def __init__(self, model_path):
         self.model = YOLO(model_path)
         self.tracker = sv.ByteTrack()
-        self.tracker.match_thresh = 0.8
+        self.tracker.match_thresh = 0.7
         self.next_stable_id = 1
         self.recent_players = {}
 
@@ -70,10 +70,11 @@ class Tracker:
     def detect_frames(self, frames, batch_size=20):
         detections = []
         for i in range(0, len(frames), batch_size):
-            detections_batch = self.model.predict(frames[i:i + batch_size], conf=0.3)
+            detections_batch = self.model.predict(frames[i:i + batch_size], conf=0.2)
             detections.extend(detections_batch)
         return detections
-
+    
+    #Probably the most important function in the project
     def get_object_tracks(self, frames, read_from_stub=True, stub_path=None):
         if read_from_stub and stub_path and os.path.exists(stub_path):
             with open(stub_path, 'rb') as f:
@@ -164,7 +165,7 @@ class Tracker:
     def draw_team_ball_control(self, frame, frame_num, team_ball_control):
         overlay = frame.copy()
         h, w = frame.shape[:2]
-        x1, y1 = int(w * 0.7), int(h * 0.85)
+        x1, y1 = int(w * 0.65), int(h * 0.85)
         x2, y2 = int(w * 0.95), int(h * 0.97)
         cv2.rectangle(overlay, (x1, y1), (x2, y2), (255, 255, 255), -1)
         frame = cv2.addWeighted(overlay, 0.4, frame, 0.6, 0)
